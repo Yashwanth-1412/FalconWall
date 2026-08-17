@@ -1,14 +1,16 @@
 # FalconWall
 
 **Line-rate DDoS mitigation and packet-I/O benchmarking on Linux, built on
-eBPF/XDP.**
+eBPF/XDP — engineered for the kernel-bypass fast path.**
 
-This is the plain-markdown fallback with ASCII architecture diagrams. The
-GitHub-oriented Mermaid version is [`README.md`](README.md).
+This is the plain-markdown fallback with ASCII architecture diagrams (the
+two-path overview uses Mermaid, which renders on GitHub). See
+[`README.md`](README.md) for the complete Mermaid version.
 
-FalconWall drops malicious traffic at the XDP hook — before the kernel even
-builds an `sk_buff` — and measures exactly how fast packets can move through
-the Linux stack.
+FalconWall drops malicious traffic at the XDP hook — in the **kernel-bypass
+fast path**, before the Linux network stack builds a single `sk_buff` — and
+benchmarks every way packets can reach userspace: through the full kernel
+stack (the slow path) or around it entirely (the fast path).
 
 ---
 
@@ -16,15 +18,16 @@ the Linux stack.
 
 **⚡ 1M packets/sec at 0% loss, using 41% CPU.**
 
-FalconWall's AF_XDP backend reaches line rate while the POSIX socket backend
-saturates at ~750K pps with 24% packet loss and 66% CPU. Measured on a
-**Google C3 VM (4 vCPU, gVNIC NIC, 23 Gb/s link)**.
+FalconWall's AF_XDP backend reaches line rate via **kernel bypass** (zero
+copies, zero syscalls) while the POSIX socket backend — the full Linux network
+stack — saturates at ~750K pps with 24% packet loss and 66% CPU. Measured on
+a **Google C3 VM (4 vCPU, gVNIC NIC, 23 Gb/s link)**.
 
-| Backend | PPS @ 0% loss | CPU @ 1M pps |
-|---|---|---|
-| POSIX socket | ~500K | 66% |
-| AF_PACKET | ~500K | 74% |
-| **AF_XDP (FalconWall)** | **~1.0M** | **41%** |
+| Backend | Path | PPS @ 0% loss | CPU @ 1M pps |
+|---|---|---|---|
+| POSIX socket | slow (kernel stack) | ~500K | 66% |
+| AF_PACKET | slow (kernel stack, L2) | ~500K | 74% |
+| **AF_XDP (FalconWall)** | **fast (kernel bypass)** | **~1.0M** | **41%** |
 
 **🛡️ DDoS defense at the earliest point in the stack.**
 
@@ -55,7 +58,75 @@ FalconWall/
 
 ---
 
-## Architecture
+## Architecture: two paths through the kernel
+
+Every packet that arrives on the NIC takes exactly one of two routes to
+userspace. FalconWall lives where they fork.
+
+```mermaid
+flowchart TB
+    NIC["NIC + driver — NAPI poll<br/>hardirq → NET_RX_SOFTIRQ · DMA RX ring"] -->|"DMA → softirq"| XDP
+
+    subgraph FAST["FAST PATH — kernel bypass"]
+        FW["★ FalconWall — XDP hook (eBPF)<br/>bpf_prog_run_xdp() · native in-driver"]
+        DROP["XDP_DROP — dropped<br/>no sk_buff ever built"]
+        XSK["AF_XDP — kernel bypass<br/>umem + 4 rings · mmap-shared · lock-free"]
+        FW -->|"XDP_DROP"| DROP
+        FW -->|"XDP_REDIRECT"| XSK
+    end
+
+    subgraph SLOW["SLOW PATH — Linux network stack"]
+        SKB["① sk_buff alloc + GRO"]
+        TC["② tc ingress / Netfilter"]
+        ROUTE["③ routing → ip_rcv()"]
+        L4["④ tcp_v4_rcv / udp_rcv"]
+        Q["⑤ socket receive queue (lock)"]
+        EPOLL["⑥ epoll_wait → wakeup"]
+        SYSCALL["⑦ recvmmsg syscall"]
+        COPY["⑧ copy_to_user"]
+        CTX["⑨ context switch back"]
+        SKB --> TC --> ROUTE --> L4 --> Q --> EPOLL --> SYSCALL --> COPY --> CTX
+    end
+
+    XDP -->|"XDP_PASS — hand off to the<br/>Linux network stack"| SKB
+    CTX --> USR["USERSAPCE<br/>slow: syscall + ctx switch + copy · fast: zero syscalls, zero copies"]
+    XSK --> USR
+```
+
+### The slow path — the Linux network stack
+
+The regular kernel receive path. The NIC's DMA ring is drained by NAPI, the
+kernel **allocates an `sk_buff` per packet**, GRO coalesces frames, then the
+packet walks the whole protocol stack — Netfilter/tc, routing, `ip_rcv()`,
+`tcp_v4_rcv()`/`udp_rcv()` — lands in a lock-guarded socket queue, and is
+finally delivered to userspace through an **`epoll_wait()` + `recvmmsg()`
+syscall pair** with a **`copy_to_user()`** on every batch. Every step costs:
+**syscalls, context switches, per-packet allocations, data copies, lock
+contention**. This is the path the POSIX socket and AF_PACKET benchmark
+backends exercise end-to-end.
+
+### The fast path — kernel bypass
+
+FalconWall runs its eBPF data plane **in-driver, at the XDP hook** — inside
+`napi_poll()`, before an `sk_buff` exists. Blocked traffic never materializes
+a packet in the kernel at all (`XDP_DROP`). `XDP_REDIRECT` hands packets to an
+AF_XDP socket, where userspace reads frames **directly from `mmap`-shared
+rings over a `umem`** — **no syscalls, no context switches, no copies**, no
+per-packet allocation (buffers come from a pre-allocated pool). That is the
+kernel bypass. When FalconWall has no verdict it returns `XDP_PASS`, and the
+packet falls through into the slow path — the bridge, not the main road.
+
+### Slow path vs fast path, at a glance
+
+| Cost | Slow path (socket / AF_PACKET) | Fast path (AF_XDP) |
+|---|---|---|
+| syscall | `epoll_wait()` + `recvmmsg()` per batch | none — direct ring reads |
+| context switch | kernel ↔ user on every wakeup | none |
+| data copy | `copy_to_user()` per packet | zero — `mmap`-shared `umem` |
+| allocation | `sk_buff` from the slab per packet | none — pre-allocated frames |
+| locking | socket queue + GRO lock contention | lock-free per-queue rings |
+| verdict point | after a full stack walk | in-driver, before `sk_buff` exists |
+| **PPS @ 0% loss (measured)** | ~500K | **~1.0M** |
 
 ### The Linux RX path — where everything sits
 
@@ -165,8 +236,10 @@ Four rings coordinate the driver and the application (all `mmap`-shared):
 
 ## 1. DDoS Mitigator (`wall/`)
 
-A stateless firewall attached to the XDP hook. All traffic decisions happen in
-the eBPF **data plane**; userspace only manages state via pinned BPF maps.
+A stateless firewall attached to the XDP hook — mitigation at the earliest
+point in the kernel, before the network stack even runs. All traffic decisions
+happen in the eBPF **data plane**; userspace only manages state via pinned BPF
+maps.
 
 ### Architecture
 
@@ -270,14 +343,17 @@ the Makefile). The `watch` loop never changes. Built-in: `rate`, `synflood`,
 ## 2. Packet I/O Benchmark (`benchmark/`)
 
 Benchmarks the Linux packet I/O stack **top to bottom** by running the *same*
-workload against progressively lower-level backends:
+workload against the **slow path** (kernel network stack) and the
+**kernel-bypass fast path** (AF_XDP):
 
 ```
-POSIX Socket  →  AF_PACKET (raw L2)  →  AF_XDP (copy)  →  AF_XDP (zero-copy)
+POSIX Socket (slow, L4) → AF_PACKET (slow, L2) → AF_XDP copy → AF_XDP zero-copy (fast)
 ```
 
-Backends are selected at compile time (CRTP/templates, no virtual dispatch in
-the hot path) and share one zero-copy parser (Ethernet → IPv4 → TCP/UDP).
+Every layer of the slow path pays its price — syscalls, context switches,
+copies, allocations — and the fast path pays none. Backends are selected at
+compile time (CRTP/templates, no virtual dispatch in the hot path) and share
+one zero-copy parser (Ethernet → IPv4 → TCP/UDP).
 
 ### Building
 
