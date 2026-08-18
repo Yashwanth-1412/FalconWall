@@ -16,18 +16,22 @@ stack (the slow path) or around it entirely (the fast path).
 
 ## Highlights
 
-**⚡ 1M packets/sec at 0% loss, using 41% CPU.**
+**⚡ ~1.8M packets/sec at 0% loss for 1442-byte Ethernet frames.**
 
-FalconWall's AF_XDP backend reaches line rate via **kernel bypass** (zero
-copies, zero syscalls) while the POSIX socket backend — the full Linux network
-stack — saturates at ~750K pps with 24% packet loss and 66% CPU. Measured on
-a **Google C3 VM (4 vCPU, gVNIC NIC, 23 Gb/s link)**.
+FalconWall's AF_XDP backend reaches ~1.8M pps via **kernel bypass** (zero
+copies, zero syscalls) with 0% observed loss. The POSIX socket backend — the
+full Linux network stack — is already lossy at 1M offered pps and receives
+about 500K pps. Measured on a **Google C3 VM (4 vCPU, gVNIC NIC, 23 Gb/s link)**.
 
-| Backend | Path | PPS @ 0% loss | CPU @ 1M pps |
+| Backend | Path | Highest observed 0-loss rate | Reference CPU |
 |---|---|---|---|
-| POSIX socket | slow (kernel stack) | ~500K | 66% |
-| AF_PACKET | slow (kernel stack, L2) | ~500K | 74% |
-| **AF_XDP (FalconWall)** | **fast (kernel bypass)** | **~1.0M** | **41%** |
+| POSIX socket | slow (kernel stack) | <1M offered | ~48% @ 1M |
+| AF_PACKET | slow (kernel stack, L2) | <1M offered | ~50% @ 1M |
+| **AF_XDP (FalconWall)** | **fast (kernel bypass)** | **~1.8M offered** | **~31% @ 1.8M** |
+
+The ~1.8M result is the highest **observed** 0%-loss point in the repeated
+Run 2 sweep; the exact saturation point above 1.8M still needs a fixed-window
+follow-up. See [`benchmark/docs/benchmark_results_run2.md`](benchmark/docs/benchmark_results_run2.md).
 
 **🛡️ DDoS defense at the earliest point in the stack.**
 
@@ -126,7 +130,7 @@ packet falls through into the slow path — the bridge, not the main road.
 | allocation | `sk_buff` from the slab per packet | none — pre-allocated frames |
 | locking | socket queue + GRO lock contention | lock-free per-queue rings |
 | verdict point | after a full stack walk | in-driver, before `sk_buff` exists |
-| **PPS @ 0% loss (measured)** | ~500K | **~1.0M** |
+| **PPS @ 0% loss (observed)** | ~500K | **~1.8M** |
 
 ### The Linux RX path — where everything sits
 
@@ -374,8 +378,8 @@ sudo taskset -c 2 ./build/falcon-rxbench packet ens4 30   # AF_PACKET
 sudo taskset -c 2 ./build/falcon-rxbench socket 9100 30   # POSIX socket
 ```
 
-Full methodology and results (including the 1M pps / 0% loss numbers above)
-are in [`benchmark/docs/`](benchmark/docs/).
+Full methodology and results, including the repeated ~1.8M pps / 0% loss
+observation, are in [`benchmark/docs/`](benchmark/docs/).
 
 ---
 
